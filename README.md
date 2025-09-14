@@ -228,4 +228,4 @@ kaggle.json
 
 ## ライセンス
 
-Aprach2
+Apache 2.0 License

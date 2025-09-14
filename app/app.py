@@ -53,17 +53,16 @@ def normalize_slug(url: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]", "-", slug) or "kaggle_course"
 
 def normalize_kernel_slug(url: str) -> str:
-    # 例: https://www.kaggle.com/code/asta5107/exercise-a-single-neuron/edit → exercise-a-single-neuron
     parts = url.strip().rstrip("/").split("/")
     if len(parts) >= 2:
         last = parts[-1]
-        if last in ("edit", "script"):  # editビューなど
+        if last in ("edit", "script"):
             last = parts[-2]
         return re.sub(r"[^a-zA-Z0-9._-]", "-", last) or "kaggle_kernel"
     return "kaggle_kernel"
 
 # =========================================================
-# Discussion 一覧取得
+# Discussion 一覧取得（一覧URLは /competitions/<slug>/discussion に正規化して使う）
 # =========================================================
 def fetch_discussion_list(comp_base_url: str, page: int = 1, max_items: int = 30):
     list_url = f"{comp_base_url}/discussion"
@@ -91,7 +90,7 @@ def fetch_discussion_list(comp_base_url: str, page: int = 1, max_items: int = 30
             full = "https://www.kaggle.com" + href if href.startswith("/") else href
             if full in seen:
                 continue
-            title = a.get_text(strip=True)
+            title = a.get_text(strip=True) or full.rsplit("/", 1)[-1]
             if re.fullmatch(r"comments?", title, flags=re.IGNORECASE):
                 continue
             threads.append({"title": title, "url": full})
@@ -101,6 +100,10 @@ def fetch_discussion_list(comp_base_url: str, page: int = 1, max_items: int = 30
     finally:
         d.quit()
     return threads
+
+def discussion_id_from_url(url: str) -> str:
+    """.../discussion/<id> -> <id>"""
+    return url.rstrip("/").split("/")[-1]
 
 # =========================================================
 # Streamlit アプリ
@@ -112,6 +115,7 @@ st.title("Kaggle Competition Translator")
 OUT_DIR.mkdir(exist_ok=True)
 (out_course := OUT_DIR / "course").mkdir(parents=True, exist_ok=True)
 (out_kernel := OUT_DIR / "kernel").mkdir(parents=True, exist_ok=True)
+(out_discussion := OUT_DIR / "discussion").mkdir(parents=True, exist_ok=True)
 
 # ====== コンペURL入力（既存） ======
 url_in = st.text_input(
@@ -166,22 +170,25 @@ show_md_pair("overview", tabs[0])
 show_md_pair("data", tabs[1])
 show_md_pair("rules", tabs[2])
 
-# ---------- Discussion ----------
+# ---------- Discussion（左：スレ一覧／右：選択スレの日本語訳を自動表示） ----------
 with tabs[3]:
-    st.subheader("Discussion — ページ送り＋ページ指定＋日本語化（任意）")
+    st.subheader("Discussion — スレ選択で右に日本語訳を表示")
 
+    # ページ管理
     if "page" not in st.session_state:
         st.session_state.page = 1
+    if "selected_disc_url" not in st.session_state:
+        st.session_state.selected_disc_url = ""
 
-    col1, col2, col3 = st.columns([1,1,2])
-    with col1:
+    col_nav = st.columns([1, 1, 2])
+    with col_nav[0]:
         if st.button("◀ 前のページ"):
             if st.session_state.page > 1:
                 st.session_state.page -= 1
-    with col2:
+    with col_nav[1]:
         if st.button("次のページ ▶"):
             st.session_state.page += 1
-    with col3:
+    with col_nav[2]:
         page_input = st.number_input("ページ指定", min_value=1, step=1,
                                      value=st.session_state.page, key="page_input")
         if page_input != st.session_state.page:
@@ -189,13 +196,85 @@ with tabs[3]:
 
     st.write(f"### 現在のページ: {st.session_state.page}")
 
-    if comp_base:
-        threads = fetch_discussion_list(comp_base, page=st.session_state.page)
+    left, right = st.columns([1, 2], gap="large")
+
+    with left:
+        st.markdown("**スレッド一覧**")
+        threads = fetch_discussion_list(comp_base, page=st.session_state.page, max_items=40) if comp_base else []
         if not threads:
             st.info("スレッドが見つかりませんでした。")
+            st.stop()
+
+        # ラベル（タイトル）と値（URL）の radio
+        labels = [f"{i+1}. {t['title']}" for i, t in enumerate(threads)]
+        urls = [t["url"] for t in threads]
+
+        # 現在の選択を維持
+        default_index = 0
+        if st.session_state.selected_disc_url in urls:
+            default_index = urls.index(st.session_state.selected_disc_url)
+
+        choice = st.radio(
+            "表示したいスレッドを選択",
+            options=list(range(len(labels))),
+            format_func=lambda i: labels[i],
+            index=default_index if len(labels) > 0 else 0,
+            key="disc_radio",
+        )
+        selected_url = urls[choice]
+        st.session_state.selected_disc_url = selected_url
+
+        # 便利ボタン
+        st.link_button("Kaggleで開く", selected_url)
+
+        # 再翻訳トグル
+        force_retranslate = st.checkbox("毎回 強制再翻訳（キャッシュ無視）", value=False, help="チェックすると選択のたびに再翻訳します。")
+
+    with right:
+        st.markdown("**日本語訳プレビュー**")
+        # 1) 英語MDが無ければスクレイプ保存
+        disc_id = discussion_id_from_url(selected_url)
+        en_md = out_discussion / f"discussion_{disc_id}.md"
+        ja_md = out_discussion / f"discussion_{disc_id}.ja.md"
+
+        need_scrape = not en_md.exists()
+        need_translate = force_retranslate or (not ja_md.exists())
+
+        # 2) 取得＆翻訳（必要に応じて）
+        with st.status("Loading selected discussion ...", expanded=False) as s:
+            if need_scrape:
+                s.write("Fetching English markdown ...")
+                subprocess.run(
+                    py("discussion_scraper.py") + [
+                        "--thread", selected_url,
+                        "--out", str(out_discussion)
+                    ],
+                    check=True
+                )
+
+            if not os.getenv("GOOGLE_API_KEY"):
+                if need_translate:
+                    s.write("GOOGLE_API_KEY 未設定のため翻訳はスキップします。英語を表示します。")
+            else:
+                if need_translate:
+                    s.write("Translating to Japanese with Gemini ...")
+                    subprocess.run(
+                        py("translate_markdown_with_gemini.py") + [
+                            "--in", str(out_discussion),
+                            "--glob", f"discussion_{disc_id}.md"
+                        ],
+                        check=True
+                    )
+            s.update(label="Done!")
+
+        # 3) 表示（優先：日本語、なければ英語）
+        if ja_md.exists():
+            st.markdown(ja_md.read_text(encoding="utf-8"))
+        elif en_md.exists():
+            st.info("日本語訳が無いため英語を表示しています。")
+            st.markdown(en_md.read_text(encoding="utf-8"))
         else:
-            for i, t in enumerate(threads, 1):
-                st.markdown(f"**{i}. [{t['title']}]({t['url']})**")
+            st.error("本文の取得に失敗しました。")
 
 # ---------- Notebook/Course タブ（Selenium/iframe版） ----------
 def show_course_md_pair(slug: str, tab):
@@ -267,7 +346,7 @@ def show_kernel_md_pair(slug: str, tab):
             else: st.info("まだ翻訳されていません。")
 
 with tabs[5]:
-    st.subheader("My Notebook (API) → 英語MD取得 & 日本語訳（Kaggle API 使用）")
+    st.subheader("My Notebook (API) → 英語MDを取得 & 日本語訳（Kaggle API 使用）")
 
     kaggle_json = Path.home() / ".kaggle" / "kaggle.json"
     if not kaggle_json.exists():
@@ -282,7 +361,7 @@ with tabs[5]:
 
     api_url = st.text_input(
         "自分のNotebook URL（view/editどちらでも可）",
-        "https://www.kaggle.com/",
+        "https://www.kaggle.com/code/asta5107/exercise-a-single-neuron/edit",
         help="例) https://www.kaggle.com/code/<yourname>/<slug> または /edit"
     )
     api_slug = normalize_kernel_slug(api_url)
